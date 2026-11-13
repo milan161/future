@@ -53,6 +53,27 @@ def json_resp(handler, obj, status=200):
     handler.wfile.write(body)
 
 
+def _today_str():
+    """返回今天的 YYYY-MM-DD。实时口径一律按「今天」判合约是否还在交易。"""
+    return datetime.now().date().strftime("%Y-%m-%d")
+
+
+def _realtime_symbols(variety):
+    """实时口径的合约清单：按今天筛选，已摘牌合约不进清单。
+
+    ⚠️ 口径必须与历史接口分开，别混用：
+      · /api/basis、/api/history、/api/pair 是历史回溯，as_of 必须取「数据最新日」，
+        否则数据停更时历史序列会错位；
+      · /api/realtime* 和 /api/move 的「当前」是给今天看盘/下单用的，必须按今天。
+
+    data_source.get_active_symbols 的 as_of 默认取数据里最新日期。一旦数据停更
+    （例：本机 6 周没更新，latest=2026-09-30），最后交易日 10-16 的 IC2610
+    仍会被判「在交易」；而 days_left 又按今天算 → -28 天、年化空、基差拿摘牌
+    冻结价减今日现货，页面上就出现一整行无意义数据（2026-11-13 实测）。
+    """
+    return ds.get_active_symbols(variety, as_of=_today_str())
+
+
 def build_realtime_payload(variety, quotes=None, spot_q=None):
     """
     组装单个品种的实时行情 payload。
@@ -64,7 +85,7 @@ def build_realtime_payload(variety, quotes=None, spot_q=None):
     基差/年化计算逻辑，绝不能写两份 —— 写两份迟早会漂移，两处数字对不上。
     """
     cfg = VARIETIES.get(variety, {})
-    syms = ds.get_active_symbols(variety)
+    syms = _realtime_symbols(variety)
     if quotes is None:
         quotes = rt.fetch_futures_quote(syms)
     if spot_q is None:
@@ -85,6 +106,10 @@ def build_realtime_payload(variety, quotes=None, spot_q=None):
             _today = datetime.now().date()
             _ltd = datetime.strptime(ltd, "%Y-%m-%d").date()
             days_left = (_ltd - _today).days
+        # 防御闸门：实时看板不展示已到期合约。即使上游口径再漂移、或行情源
+        # 返回摘牌合约的冻结价，也不会渲染出负基差 / 空年化的脏行。
+        if days_left is not None and days_left <= 0:
+            continue
         basis = None
         basis_pct = None
         annual = None
@@ -389,7 +414,7 @@ class Handler(SimpleHTTPRequestHandler):
             all_syms = []
             sym_map = {}
             for v in varieties:
-                syms = ds.get_active_symbols(v)
+                syms = _realtime_symbols(v)
                 sym_map[v] = syms
                 all_syms.extend(syms)
             all_quotes = rt.fetch_futures_quote(all_syms)
@@ -510,7 +535,9 @@ class Handler(SimpleHTTPRequestHandler):
             live_prices = None
             live_date = None
             try:
-                syms = ds.get_active_symbols(variety)
+                # 「当前」价差按今天的在交易合约取，别再沿用数据最新日：
+                # 否则摘牌合约的冻结价会混进来，算出 60%+ 的假年化。
+                syms = _realtime_symbols(variety)
                 qs = rt.fetch_futures_quote(syms)
                 lp = {q["symbol"]: q["price"] for q in qs if q.get("price")}
                 if lp:
@@ -518,7 +545,9 @@ class Handler(SimpleHTTPRequestHandler):
                     live_date = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
             except Exception:
                 pass
-            rows = engine.move_helper_table(variety, years=years,
+            # 合约对清单同样按今天构造（build_pairs 内部走 get_active_symbols），
+            # 与 live_prices 同源，避免「9-30 的合约对 + 今天的价」口径打架。
+            rows = engine.move_helper_table(variety, years=years, as_of=_today_str(),
                                             live_prices=live_prices, live_date=live_date)
             for r in rows:
                 r.pop("series", None)
