@@ -754,6 +754,9 @@ createApp({
     ];
     const ranges = [{v:1,n:'近1年'},{v:3,n:'近3年'},{v:5,n:'近5年'},{v:0,n:'全部'}];
     const metaText = ref('数据加载中...');
+    // meta 首屏失败标记 + 上次请求时间：只在失败态低频补刷，成功态不额外发请求
+    const metaFailed = ref(false);
+    let lastMetaFetch = 0;
     // ---- 一键更新数据（仅本机；线上 allow_refresh=false 时整条不渲染）----
     // 抓取要跑几分钟（枚举 4 个品种共 600 个候选合约），所以必须异步 + 轮询进度，
     // 不能同步等 —— 前端 20 秒就超时了。
@@ -763,8 +766,12 @@ createApp({
     let refreshTimer = null;
 
     async function loadMeta() {
+      lastMetaFetch = Date.now();
       try {
-        const m = await get('/api/meta');
+        // 与主面板一致走 getRetry：CF 回源抖动时自动重试一次。
+        // 2026-11-12 实测：meta 用裸 get 时 4 次里 2 次 20s 超时，于是标题显示
+        // 「历史数据日期未知」，而后端 latest_date 一直是好的 —— 是请求没回来，不是数据没日期。
+        const m = await getRetry('/api/meta');
         if (m && m.ok) {
           let txt = '行情实时 · 历史数据截至 ' + (m.latest_date || '-');
           // 本机模式（allow_refresh=true）额外显示服务 PID。
@@ -774,11 +781,15 @@ createApp({
           if (m.allow_refresh && m.pid) txt += ' · PID ' + m.pid;
           metaText.value = txt;
           allowRefresh.value = !!m.allow_refresh;
+          metaFailed.value = false;
         } else {
-          metaText.value = '历史数据日期未知';
+          // 兜底文案要说清是「请求失败」，别让读者误以为历史数据本身缺日期
+          metaText.value = '行情实时 · 数据日期读取失败（自动重试中）';
+          metaFailed.value = true;
         }
       } catch (e) {
-        metaText.value = '历史数据日期未知';
+        metaText.value = '行情实时 · 数据日期读取失败（自动重试中）';
+        metaFailed.value = true;
       }
     }
 
@@ -1536,9 +1547,11 @@ createApp({
     onMounted(async () => {
       // 分段渲染：meta 和 realtime 各管各的，谁先回来谁先出内容。
       // 原来串行 await 且无兜底，任一环节卡住整页就是白屏（线上事故根因）。
-      // meta 只影响右上角那行小字，拿不到也不该挡住主内容。
+      // meta 只影响标题那行小字，拿不到也不该挡住主内容。
+      // 2026-11-12 修：注释一直写「分段」，代码却是 await loadMeta(); await loadBasis();
+      // CF 回源抖动时 meta 卡满 20s，会把主面板一起拖住 —— 改成不 await meta。
       // 它同时带回 allow_refresh —— 决定「更新数据」按钮要不要出现。
-      await loadMeta();
+      loadMeta();
       // 主内容：失败会在 loadBasis 内部写 fetchErr，页面显示重试按钮
       await loadBasis();
       // 若通过 URL 指定了 Tab，进入后按需加载对应数据
@@ -1549,6 +1562,8 @@ createApp({
       setInterval(() => {
         const gap = isTrading.value ? 5000 : 60000;
         const now = Date.now();
+        // meta 首屏只拉一次；失败态下每 60s 补拉，成功后不再发请求（不增加正常态流量）
+        if (metaFailed.value && now - lastMetaFetch >= 60000) loadMeta();
         if (tab.value === 'basis' && now - lastFetch >= gap) { lastFetch = now; loadBasis(); }
         if (tab.value === 'move' && moveGroups.value.length && now - lastMoveFetch >= gap) {
           lastMoveFetch = now; loadMove(true);
