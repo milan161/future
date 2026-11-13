@@ -221,7 +221,7 @@
         <span class="nm">{{ g.name }}</span>
         <span class="code">{{ g.variety }}</span>
         <span class="px">{{ fmt(g.spot.price,2) }}</span>
-        <span class="chg" :class="(g.spot.change_pct||0)>=0?'up':'down'">
+        <span class="chg" :class="(g.spot.change_pct||0)>=0?'up':'down'" title="现货指数对前收盘计算">
           {{ g.spot.change_pct!=null?(g.spot.change_pct>=0?'+':'')+fmt(g.spot.change_pct,2)+'%':'' }}
         </span>
         <span class="chga" :class="(g.spot.change||0)>=0?'up':'down'">
@@ -236,7 +236,7 @@
       <div class="bd">
         <table>
           <thead><tr>
-            <th>合约</th><th>价格</th><th>日内</th><th>涨跌额</th><th>剩余天</th><th>基差</th><th>折合年化</th>
+            <th>合约</th><th>价格</th><th title="期货涨跌幅按交易所惯例对「昨结算」计算；上方现货指数对「前收盘」计算，两者基准不同">日内(昨结)</th><th title="涨跌额 = 现价 − 昨结算">涨跌额</th><th>剩余天</th><th>基差</th><th>折合年化</th>
           </tr></thead>
           <tbody>
             <tr v-for="r in g.rows" :key="r.symbol">
