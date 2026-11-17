@@ -59,6 +59,11 @@ def _fetch_raw(codes):
     return out
 
 
+def fetch_bulk_raw(codes):
+    """公开批量入口：期货合约 + 现货指数合并成一次新浪请求（2026-11-14）。"""
+    return _fetch_raw(codes)
+
+
 def _f(x):
     try:
         return float(x)
@@ -66,7 +71,7 @@ def _f(x):
         return None
 
 
-def fetch_futures_quote(symbols):
+def fetch_futures_quote(symbols, _raw=None):
     """
     拉取期货实时行情。
     symbols: ['IC2610', 'IC2611', 'i2701', ...]
@@ -83,7 +88,7 @@ def fetch_futures_quote(symbols):
     if not symbols:
         return []
     codes = ["nf_" + s.upper() for s in symbols]
-    data = _fetch_raw(codes)
+    data = _raw if _raw is not None else _fetch_raw(codes)
     out = []
     for s in symbols:
         f = data.get("nf_" + s.upper())
@@ -117,7 +122,7 @@ def fetch_futures_quote(symbols):
     return out
 
 
-def fetch_index_quote(spot_code):
+def fetch_index_quote(spot_code, _raw=None):
     """
     拉取现货指数实时行情。spot_code 形如 'sh000905'。
     返回 dict: {name, price, pre_close, open, high, low, change, change_pct, date, time}
@@ -127,7 +132,7 @@ def fetch_index_quote(spot_code):
     """
     if not spot_code:
         return None
-    data = _fetch_raw([spot_code])
+    data = _raw if _raw is not None else _fetch_raw([spot_code])
     f = data.get(spot_code)
     if not f or len(f) < 6:
         return None

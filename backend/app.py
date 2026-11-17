@@ -407,31 +407,15 @@ class Handler(SimpleHTTPRequestHandler):
         # 新浪接口本身支持逗号批量（见 realtime._fetch_raw），所以能一次性把所有
         # 品种的行情拉回来，四个品种共用一次出网请求。首屏请求数 5 → 2。
         if path == "/api/realtime_all":
-            # 只拉「已接入」的品种 —— 数据层认得但没接好的品种（铁矿石）没有
-            # 现货代码，会把 None 塞进新浪请求导致 500（2026-10-04 实测踩到）。
-            varieties = list(ENABLED_VARIETIES)
-            # 一次性收集全部合约代码 + 现货代码，合成单次新浪请求
-            all_syms = []
-            sym_map = {}
-            for v in varieties:
-                syms = _realtime_symbols(v)
-                sym_map[v] = syms
-                all_syms.extend(syms)
-            all_quotes = rt.fetch_futures_quote(all_syms)
-
-            payloads = {}
-            for v in varieties:
-                cfg = VARIETIES.get(v, {})
-                # 从批量结果里筛出本品种的合约
-                mine = [q for q in all_quotes if q["symbol"] in set(sym_map[v])]
-                spot_q = rt.fetch_index_quote(cfg.get("spot_code"))
-                payloads[v] = build_realtime_payload(v, quotes=mine, spot_q=spot_q)
-            return json_resp(self, {
-                "ok": True,
-                "varieties": payloads,
-                "is_trading": rt.is_trading_time(),
-                "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
+            # 2026-11-14：改读后台聚合的内存快照。
+            # 原实现每个 HTTP 请求串行发 5 次跨洋请求（16 期货代码 1 次 +
+            # 4 个现货指数各 1 次，实测 2.51s），前端 5 秒轮询 ⇒ N 个用户
+            # 就是 N×12 次/分外网抓取。现在外网频率与用户数彻底解耦。
+            with _RT_LOCK:
+                payload = _RT_CACHE.get("payload")
+            if payload is None:
+                payload = _build_realtime_all()   # 冷启动兜底：后台线程尚无首轮结果
+            return json_resp(self, payload)
 
         if path == "/api/history":
             variety = arg("variety", "IC")
@@ -570,7 +554,77 @@ class Handler(SimpleHTTPRequestHandler):
         return json_resp(self, {"ok": False, "error": "unknown api"}, 404)
 
 
+# ============================================================
+# 实时行情后台聚合（2026-11-14）
+#   20 个代码（16 期货合约 + 4 个现货指数）合并成 1 次新浪请求，实测 0.50s / 全命中；
+#   后台单任务交易时段每 10s 抓一次放内存，handler 只读内存。
+#   失败退避、非交易时段降频到 60s（保留最后一份收盘价，不空转刷屏）。
+# ============================================================
+_RT_LOCK = threading.Lock()
+_RT_CACHE = {"payload": None, "ts": 0.0, "error": ""}
+_RT_REFRESH_SEC = 10
+_RT_IDLE_SEC = 60
+
+
+def _build_realtime_all():
+    varieties = list(ENABLED_VARIETIES)
+    all_syms, sym_map, spot_codes = [], {}, []
+    for v in varieties:
+        syms = _realtime_symbols(v)
+        sym_map[v] = syms
+        all_syms.extend(syms)
+        sc = VARIETIES.get(v, {}).get("spot_code")
+        if sc:
+            spot_codes.append(sc)
+    spot_codes = list(dict.fromkeys(spot_codes))
+    codes = ["nf_" + s.upper() for s in all_syms] + spot_codes
+    raw = rt.fetch_bulk_raw(codes)                       # ← 唯一一次外网请求
+    all_quotes = rt.fetch_futures_quote(all_syms, _raw=raw)
+    spot_map = {sc: rt.fetch_index_quote(sc, _raw=raw) for sc in spot_codes}
+    payloads = {}
+    for v in varieties:
+        mine = [q for q in all_quotes if q["symbol"] in set(sym_map[v])]
+        payloads[v] = build_realtime_payload(
+            v, quotes=mine,
+            spot_q=spot_map.get(VARIETIES.get(v, {}).get("spot_code")))
+    return {
+        "ok": True,
+        "varieties": payloads,
+        "is_trading": rt.is_trading_time(),
+        "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _realtime_worker():
+    failures = 0
+    while True:
+        try:
+            payload = _build_realtime_all()
+            with _RT_LOCK:
+                _RT_CACHE["payload"] = payload
+                _RT_CACHE["ts"] = time.time()
+                _RT_CACHE["error"] = ""
+            failures = 0
+        except Exception as e:
+            failures += 1
+            with _RT_LOCK:
+                _RT_CACHE["error"] = "%s %s" % (datetime.now().strftime("%H:%M:%S"), e)
+            print("[realtime] 抓取失败(%d): %s" % (failures, e), flush=True)
+        interval = _RT_REFRESH_SEC if rt.is_trading_time() else _RT_IDLE_SEC
+        if failures:
+            interval = min(60, interval * failures)
+        time.sleep(interval)
+
+
+def start_realtime_worker():
+    t = threading.Thread(target=_realtime_worker, name="future-realtime", daemon=True)
+    t.start()
+    print("[realtime] 后台聚合已启动（交易 %ds / 非交易 %ds，单次 1 请求）"
+          % (_RT_REFRESH_SEC, _RT_IDLE_SEC), flush=True)
+
+
 def main():
+    start_realtime_worker()
     port = int(os.environ.get("FUTURE_PORT", DEFAULT_PORT))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"future 服务已启动: http://127.0.0.1:{port}")
