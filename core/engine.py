@@ -168,6 +168,11 @@ def variety_history(variety, use_cache=True):
     做法：对每个交易日，取当时在交易的"次月合约"（第2近月）作为基准，
     计算该合约当日的基差与年化。
 
+    2026-11-17 基准连续性闸门：仍按原规则每日取第 2 近月（保证自然换月），
+    但若新基准与上一基准的月份差 >3 个月，视为当日日线残缺（如 2612→2706
+    跳 6 个月），跳过该日，避免基差 90 点与 374 点两个口径被无声拼进
+    同一条序列、分位统计随之失真。
+
     结果会缓存在进程内存里（日线级数据，一天变一次）。
     """
     if use_cache and variety in _VARIETY_HISTORY_CACHE:
@@ -186,7 +191,19 @@ def variety_history(variety, use_cache=True):
         if df is not None and len(df):
             fut_data[s] = df.set_index("date")
 
+    # 月份解析与跳变检查（IC2612 -> 2612, 2706 -> 2706）
+    def _ym(sym):
+        digits = "".join(ch for ch in sym if ch.isdigit())
+        return int(digits[-4:]) if len(digits) >= 4 else None
+
+    def _month_gap(a, b):
+        """b 相对 a 前进的月数；无法解析返回一个肯定超阈值的大数。"""
+        if a is None or b is None:
+            return 99
+        return (b // 100 - a // 100) * 12 + (b % 100 - a % 100)
+
     rows = []
+    prev_second = None
     for d in all_dates:
         # 找出当日可交易的合约
         alive = []
@@ -200,9 +217,12 @@ def variety_history(variety, use_cache=True):
         alive = sorted(alive, key=symbol_sort_key)
         if len(alive) < 2:
             continue
-        # 次月合约 = 第 2 个
-        near = alive[0]
+        # 次月合约 = 第 2 个（保持原有自然换月规则）；
+        # 但若相对上一基准跳变 >3 个月，判为当日日线残缺，跳过该日。
         second = alive[1]
+        if prev_second is not None and _month_gap(_ym(prev_second), _ym(second)) > 3:
+            continue
+        prev_second = second
         price = float(fut_data[second].loc[d]["close"])
         sp = spot_map[d]
         basis = sp - price

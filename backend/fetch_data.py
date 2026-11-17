@@ -22,6 +22,10 @@
       ② 日期级：写库时跳过库里已有的日期。
     想补齐历史或首次部署，用 --full。
   - 所有抓取都有异常兜底，单个合约失败不影响整体。
+  - **失败必须可见（2026-11-17 补）**：新浪偶发 Connection reset / 空响应，
+    单个合约重试 FETCH_RETRIES 次仍失败才放弃；失败清单醒目写进日志，并落
+    data/fetch_alert.json。退出码保持 0，避免部分失败误伤 update_data.sh
+    里的铁矿石重建；是否缺数看告警标记和日志，不再被 "fetch_rc=0" 掩盖。
 
 新浪接口（均已实测）：
   期货日线  https://stock.finance.sina.com.cn/futures/api/jsonp.php/
@@ -56,6 +60,11 @@ from config import VARIETIES  # noqa: E402  品种定义唯一真值来源在 co
 
 MONTHS_ALL = list(range(1, 13))
 
+# 新浪偶发失败：单合约/单指数重试次数与间隔（2026-11-17）。
+FETCH_RETRIES = 3
+FETCH_RETRY_SLEEP = 0.6
+ALERT_PATH = os.path.join(ROOT, "data", "fetch_alert.json")
+
 HEADERS = {
     "Referer": "https://finance.sina.com.cn",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -69,6 +78,25 @@ IDX_URL = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
 
 def log(msg):
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+
+
+def _write_fetch_alert(failed):
+    """把本次抓取失败清单落盘；全部成功时清除旧标记。
+
+    用法：下次 cron 后看 data/fetch_alert.json 是否存在，或 grep update.log
+    里的 [FETCH-ALERT]。不靠退出码，避免部分失败阻断铁矿石重建。
+    """
+    try:
+        os.makedirs(os.path.dirname(ALERT_PATH), exist_ok=True)
+        if failed:
+            payload = {"last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                       "failed": failed}
+            with open(ALERT_PATH, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        elif os.path.exists(ALERT_PATH):
+            os.remove(ALERT_PATH)
+    except Exception as e:
+        log(f"  [FETCH-ALERT] 写告警标记失败（不影响数据）: {e}")
 
 
 def _get(url, timeout=20):
@@ -85,42 +113,44 @@ def _f(x):
 
 
 # ============ 1. 期货日线（直爬新浪） ============
-def fetch_futures_daily_raw(symbol):
-    """直爬新浪期货日线。返回 list of dict，失败返回 None。
+def fetch_futures_daily_raw(symbol, retries=FETCH_RETRIES):
+    """直爬新浪期货日线。返回 list of dict，重试后仍失败返回 None。
 
     接口返回 JSONP 包装：/*...*/ var _x=([{...},{...}]);
     需要剥掉外面的注释和 var 声明。
+    2026-11-17：新浪偶发 Connection reset / 空响应，改为短间隔重试，
+    避免单合约一次抖动就让当天日线缺行、进而污染 variety_history 基准选择。
     """
-    try:
-        raw = _get(FUT_URL.format(symbol))
-    except Exception:
-        return None
-    # 剥 JSONP：取第一个 '([' 到最后一个 '])'
-    try:
-        i = raw.index("([")
-        j = raw.rindex("])")
-        body = raw[i + 1:j + 1]     # 保留成 [ ... ]
-        arr = json.loads(body)
-    except (ValueError, json.JSONDecodeError):
-        return None
-    if not arr:
-        return None
-    rows = []
-    for it in arr:
-        d = (it.get("d") or "").strip()
-        if not d:
-            continue
-        rows.append({
-            "date": d[:10],
-            "open": _f(it.get("o")),
-            "high": _f(it.get("h")),
-            "low": _f(it.get("l")),
-            "close": _f(it.get("c")),
-            "volume": _f(it.get("v")),
-            "hold": _f(it.get("p")),
-            "settle": _f(it.get("s")),
-        })
-    return rows or None
+    tries = max(1, retries)
+    for attempt in range(tries):
+        try:
+            raw = _get(FUT_URL.format(symbol))
+            # 剥 JSONP：取第一个 '([' 到最后一个 '])'
+            i = raw.index("([")
+            j = raw.rindex("])")
+            arr = json.loads(raw[i + 1:j + 1])   # 保留成 [ ... ]
+            if not arr:
+                return None
+            rows = []
+            for it in arr:
+                d = (it.get("d") or "").strip()
+                if not d:
+                    continue
+                rows.append({
+                    "date": d[:10],
+                    "open": _f(it.get("o")),
+                    "high": _f(it.get("h")),
+                    "low": _f(it.get("l")),
+                    "close": _f(it.get("c")),
+                    "volume": _f(it.get("v")),
+                    "hold": _f(it.get("p")),
+                    "settle": _f(it.get("s")),
+                })
+            return rows or None
+        except Exception:
+            if attempt + 1 < tries:
+                time.sleep(FETCH_RETRY_SLEEP)
+    return None
 
 
 def last_date_in_db(symbol):
@@ -151,25 +181,26 @@ def save_futures(symbol, rows, incremental=True):
 
 
 # ============ 2. 指数日线（直爬新浪） ============
-def fetch_index_daily_raw(code):
-    """直爬新浪指数日线。code 形如 sh000905。返回 list of dict。"""
-    try:
-        raw = _get(IDX_URL.format(code))
-    except Exception:
-        return None
-    try:
-        arr = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not arr:
-        return None
-    rows = []
-    for it in arr:
-        d = (it.get("day") or "").strip()
-        if not d:
-            continue
-        rows.append({"date": d[:10], "close": _f(it.get("close"))})
-    return rows or None
+def fetch_index_daily_raw(code, retries=FETCH_RETRIES):
+    """直爬新浪指数日线。code 形如 sh000905。返回 list of dict。重试后仍失败返回 None。"""
+    tries = max(1, retries)
+    for attempt in range(tries):
+        try:
+            raw = _get(IDX_URL.format(code))
+            arr = json.loads(raw)
+            if not arr:
+                return None
+            rows = []
+            for it in arr:
+                d = (it.get("day") or "").strip()
+                if not d:
+                    continue
+                rows.append({"date": d[:10], "close": _f(it.get("close"))})
+            return rows or None
+        except Exception:
+            if attempt + 1 < tries:
+                time.sleep(FETCH_RETRY_SLEEP)
+    return None
 
 
 def last_index_date_in_db(code):
@@ -393,6 +424,7 @@ def main():
 
     # ---- [1/3] 现货指数 ----
     log("\n[1/3] 现货指数日线")
+    failed = []   # 2026-11-17：汇总失败项，结束前醒目告警 + 落盘
     for v in varieties:
         code = VARIETIES[v].get("spot_code")
         if not code:
@@ -401,7 +433,8 @@ def main():
             continue
         rows = fetch_index_daily_raw(code)
         if not rows:
-            log(f"  ✗ {v} ({code}) 抓取失败")
+            failed.append(f"{v}/{code}(现货)")
+            log(f"  ✗ {v} ({code}) 抓取失败（重试 {FETCH_RETRIES} 次）")
             continue
         n, _ = save_index(code, rows, incremental=incremental)
         total = len(rows)
@@ -425,6 +458,8 @@ def main():
             tried += 1
             rows = fetch_futures_daily_raw(s)
             if not rows:
+                failed.append(f"{v}/{s}")
+                log(f"    ⚠ {s} 抓取失败（重试 {FETCH_RETRIES} 次），当日该合约可能缺行")
                 continue
             n, success = save_futures(s, rows, incremental=incremental)
             if success:
@@ -443,6 +478,16 @@ def main():
     for k, val in db.stats().items():
         log(f"    {k}: {val}")
     log(f"本次新写入期货日线 {grand_new} 行")
+
+    # 2026-11-17：失败必须可见。退出码仍为 0（不误伤铁矿重建），
+    # 但日志醒目 + data/fetch_alert.json 落盘，不再被 fetch_rc=0 掩盖。
+    if failed:
+        log(f"[FETCH-ALERT] ⚠️⚠️ 本次有 {len(failed)} 项抓取失败，日线可能残缺：")
+        log(f"[FETCH-ALERT]   {', '.join(failed)}")
+        log("[FETCH-ALERT]   详见 data/fetch_alert.json；variety_history 基准可能受影响")
+    else:
+        log("[FETCH-ALERT] OK 本次全部抓取成功")
+    _write_fetch_alert(failed)
 
 
 if __name__ == "__main__":
