@@ -11,9 +11,11 @@
       < 0 → 远月更便宜（正常贴水结构）
   价差年化 = (价差 / 近月价格) * (365 / 两合约月份差对应天数) * 100%
 """
+import math
 import os
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
 from config import CACHE_DIR, VARIETIES
@@ -162,6 +164,19 @@ def basis_series(variety, symbol):
 _VARIETY_HISTORY_CACHE = {}
 
 
+def _ym(sym):
+    """IC2612 -> 2612；解析失败返回 None。"""
+    digits = "".join(ch for ch in str(sym) if ch.isdigit())
+    return int(digits[-4:]) if len(digits) >= 4 else None
+
+
+def _month_gap(a, b):
+    """b 相对 a 前进的月数；无法解析返回一个肯定超阈值的大数。"""
+    if a is None or b is None:
+        return 99
+    return (b // 100 - a // 100) * 12 + (b % 100 - a % 100)
+
+
 def variety_history(variety, use_cache=True):
     """
     构建品种的历史基差/年化序列。
@@ -185,31 +200,30 @@ def variety_history(variety, use_cache=True):
     all_dates = sorted(spot_map.keys())
 
     # 预载每个合约的数据
-    fut_data = {}
+    # 性能：last_trade_date 以前放在日循环里（1900 天 × 每个在交易合约），
+    # 内部每次都要 load_contract_info() + pandas 过滤，一次请求上万次 → 本地 4s、
+    # ARM 上 20s+，直接撞穿前端 20s 超时。合约的最后交易日与日期无关，
+    # 按合约算一次即可；同理日期集合也预取成 set，避免逐日 `d in df.index`。
+    dates_by_sym, ltd_map, close_map = {}, {}, {}
     for s in syms:
+        ltd_map[s] = symbol_last_trade_date(s)
         df = load_futures(s)
         if df is not None and len(df):
-            fut_data[s] = df.set_index("date")
+            # close_map 是为了避免逐日 `df.loc[d]`（1900 次 pandas 定位，
+            # 比 dict 取值慢两个数量级）
+            close_map[s] = dict(zip(df["date"], df["close"]))
+            dates_by_sym[s] = set(close_map[s].keys())
 
-    # 月份解析与跳变检查（IC2612 -> 2612, 2706 -> 2706）
-    def _ym(sym):
-        digits = "".join(ch for ch in sym if ch.isdigit())
-        return int(digits[-4:]) if len(digits) >= 4 else None
-
-    def _month_gap(a, b):
-        """b 相对 a 前进的月数；无法解析返回一个肯定超阈值的大数。"""
-        if a is None or b is None:
-            return 99
-        return (b // 100 - a // 100) * 12 + (b % 100 - a % 100)
+    # 月份解析与跳变检查用模块级 _ym / _month_gap（固定期限插值也要用）
 
     rows = []
     prev_second = None
     for d in all_dates:
         # 找出当日可交易的合约
         alive = []
-        for s, df in fut_data.items():
-            if d in df.index:
-                ltd = symbol_last_trade_date(s)
+        for s in close_map:
+            if d in dates_by_sym[s]:
+                ltd = ltd_map.get(s)
                 if ltd and ltd >= d:
                     alive.append(s)
         if not alive:
@@ -223,10 +237,10 @@ def variety_history(variety, use_cache=True):
         if prev_second is not None and _month_gap(_ym(prev_second), _ym(second)) > 3:
             continue
         prev_second = second
-        price = float(fut_data[second].loc[d]["close"])
+        price = float(close_map[second][d])
         sp = spot_map[d]
         basis = sp - price
-        ltd = symbol_last_trade_date(second)
+        ltd = ltd_map.get(second)
         days_left = (datetime.strptime(ltd, "%Y-%m-%d") - datetime.strptime(d, "%Y-%m-%d")).days
         annual = None
         if days_left > 0:
@@ -244,6 +258,280 @@ def variety_history(variety, use_cache=True):
     if use_cache:
         _VARIETY_HISTORY_CACHE[variety] = out
     return out
+
+
+# ============ 2b. 固定期限插值（60 / 90 天） ============
+# 为什么需要另做一套：
+#   variety_history 每天滚动取「第 2 近月」，而第 2 近月的剩余天数在一个换月
+#   周期里会从 40 天一路缩到 0；年化 = 基差率 × 365/剩余天数，分母在变，于是
+#   同一厚度的贴水（比如基差率 1.7%），离到期近时被算成 23%，离到期远时只有
+#   10%。分位数因此被「离到期多远」这个与技术无关的机械因素结构性污染 ——
+#   近月到期那几天永远排在历史高位。
+#   固定期限口径把分母钉死在 60/90 天，曲线才只反映贴水本身厚薄。
+#
+# 做法：每天取全部在交易合约，按剩余天数排序，找出跨过目标期限的两腿
+#   （d1 <= T <= d2），在「基差率」上线性插值，再按 T 成年化：
+#       r(T) = r1 + (T - d1)/(d2 - d1) * (r2 - r1)
+#       annual = r(T) * 365 / T
+#   注意插值的是**基差率**而不是年化值：年化对天数是双曲线，直接插年化
+#   会在两腿之间引入系统性偏差。
+_FT_CACHE = {}
+_CURVE_CACHE = {}
+FT_TENORS = (60, 90)
+# 两腿间隔超过这个天数，说明中间合约缺数据（不是正常期限结构），当日跳过
+_FT_MAX_LEG_GAP = 150
+
+
+def daily_contract_curves(variety, use_cache=True):
+    """
+    逐日的「合约期限结构」快照 —— 固定期限插值的原料。
+
+    返回 [{date, spot, points:[{symbol, days_left, price, basis_pct}, ...]}, ...]
+    points 按剩余天数升序，只保留剩余天数 > 0 的合约。
+
+    单次遍历该品种全部历史合约（与 variety_history 同量级，5~8 秒），
+    结果进程内缓存；一次遍历可供 60 天、90 天两套口径共用。
+    """
+    if use_cache and variety in _CURVE_CACHE:
+        return _CURVE_CACHE[variety]
+    syms = list_symbols(variety)
+    spot = load_spot(variety)
+    if not syms or spot is None or not len(spot):
+        return None
+    spot_map = dict(zip(spot["date"], spot["spot_close"]))
+    fut_map, ltd_map = {}, {}
+    for s in syms:
+        df = load_futures(s)
+        if df is None or not len(df):
+            continue
+        fut_map[s] = dict(zip(df["date"], df["close"]))
+        ltd_map[s] = symbol_last_trade_date(s)
+
+    out = []
+    for d in sorted(spot_map.keys()):
+        try:
+            sp = float(spot_map[d])
+        except (TypeError, ValueError):
+            continue
+        if sp <= 0:
+            continue
+        pts = []
+        for s, m in fut_map.items():
+            px = m.get(d)
+            if px is None or pd.isna(px):
+                continue
+            ltd = ltd_map.get(s)
+            if not ltd or ltd < d:
+                continue
+            days = (datetime.strptime(ltd, "%Y-%m-%d")
+                    - datetime.strptime(d, "%Y-%m-%d")).days
+            if days <= 0:
+                continue
+            px = float(px)
+            pts.append({"symbol": s, "days_left": days, "price": px,
+                        "basis_pct": (sp - px) / sp * 100})
+        if len(pts) < 2:
+            continue
+        pts.sort(key=lambda p: p["days_left"])
+        out.append({"date": d, "spot": sp, "points": pts})
+    if use_cache:
+        _CURVE_CACHE[variety] = out
+    return out
+
+
+def interpolate_curve(points, tenor_days):
+    """
+    在期限结构上插值到目标期限。
+
+    points: [{symbol, days_left, basis_pct}, ...]（按剩余天数升序）
+    tenor_days: 目标剩余天数（如 60）
+
+    返回 {basis_pct, near_symbol, far_symbol, days_near, days_far, weight}
+    或 None（当日曲线没跨过目标期限 / 两腿间隔异常）。
+    """
+    T = int(tenor_days)
+    if not points or len(points) < 2:
+        return None
+    if points[0]["days_left"] > T or points[-1]["days_left"] < T:
+        return None
+    for i in range(len(points) - 1):
+        a, b = points[i], points[i + 1]
+        if a["days_left"] <= T <= b["days_left"]:
+            gap = b["days_left"] - a["days_left"]
+            if gap <= 0 or gap > _FT_MAX_LEG_GAP:
+                return None
+            k = (T - a["days_left"]) / gap
+            r = a["basis_pct"] + k * (b["basis_pct"] - a["basis_pct"])
+            return {
+                "basis_pct": r,
+                "near_symbol": a["symbol"],
+                "far_symbol": b["symbol"],
+                "days_near": a["days_left"],
+                "days_far": b["days_left"],
+                "weight": k,
+            }
+    return None
+
+
+def fixed_tenor_history(variety, tenor_days=60, use_cache=True):
+    """
+    固定剩余期限（默认 60 天）的年化贴水历史序列。
+
+    与 variety_history（滚动第 2 近月）并存的第二套口径，用于对比：
+    前者是「真实可交易的基准合约」，后者是「把期限钉住后的纯贴水厚度」。
+
+    闸门与 variety_history 一致：近端合约相对上一日跳变 >3 个月（日线残缺，
+    如 2612→2706 跳 6 个月），跳过该日，避免两个口径被无声拼进同一条序列。
+
+    返回 DataFrame(date, annual, basis_pct, near_symbol, far_symbol,
+                    days_near, days_far, weight) 或 None
+    """
+    T = int(tenor_days)
+    key = (variety, T)
+    if use_cache and key in _FT_CACHE:
+        return _FT_CACHE[key]
+    curves = daily_contract_curves(variety, use_cache=use_cache)
+    if not curves:
+        return None
+    rows = []
+    prev_month = None
+    for c in curves:
+        ip = interpolate_curve(c["points"], T)
+        if ip is None:
+            continue
+        m = _ym(ip["near_symbol"])
+        if prev_month is not None and _month_gap(prev_month, m) > 3:
+            continue
+        prev_month = m
+        r = ip["basis_pct"]
+        rows.append({
+            "date": c["date"],
+            "annual": round(r * 365 / T, 2),
+            "basis_pct": round(r, 3),
+            "near_symbol": ip["near_symbol"],
+            "far_symbol": ip["far_symbol"],
+            "days_near": ip["days_near"],
+            "days_far": ip["days_far"],
+            "weight": round(ip["weight"], 3),
+        })
+    df = pd.DataFrame(rows) if rows else None
+    if use_cache:
+        _FT_CACHE[key] = df
+    return df
+
+
+# ============ 2c. 已实现波动率 & carry/波动 ============
+# 年化贴水单独看没有意义：23% 的贴水在 20% 波动的市场里是厚利，在 40% 波动的
+# 市场里只是风险补偿。carry/波动 = 年化贴水 ÷ 已实现波动率，是「每承担 1%
+# 波动，换回多少年化收益」的性价比指标。
+_VOL_CACHE = {}
+
+
+def realized_vol(variety, window=20, as_of=None, use_cache=True):
+    """
+    指数近 window 个交易日（默认 20）的年化已实现波动率（%）。
+
+    口径：对数日收益的样本标准差 × sqrt(252) × 100 —— 与期权隐含波动率
+    不是一回事，但它不需要任何额外数据源，且与「日均波动几个点」直觉一致。
+    as_of: 只取该日（含）之前的收盘价；不传则用最新收盘。
+    """
+    key = (variety, window, as_of)
+    if use_cache and key in _VOL_CACHE:
+        return _VOL_CACHE[key]
+    spot = load_spot(variety)
+    if spot is None or not len(spot):
+        return None
+    s = spot
+    if as_of:
+        s = s[s["date"] <= as_of]
+    if len(s) < window + 1:
+        return None
+    vals = [float(v) for v in s["spot_close"].tail(window + 1)]
+    if any(v <= 0 for v in vals):
+        return None
+    rets = np.diff(np.log(np.array(vals)))
+    v = float(np.std(rets, ddof=1) * math.sqrt(252) * 100)
+    if use_cache:
+        _VOL_CACHE[key] = v
+    return v
+
+
+def carry_per_vol(annual, vol):
+    """carry/波动 比值（年化贴水 ÷ 年化已实现波动率）。"""
+    if annual is None or vol is None:
+        return None
+    try:
+        annual, vol = float(annual), float(vol)
+    except (TypeError, ValueError):
+        return None
+    if vol <= 0:
+        return None
+    return round(annual / vol, 2)
+
+
+# ---- carry/波动 的历史序列：让「0.66」有分位，而不是一个孤立的数 ----
+# 单点的 carry/波动 只能告诉你「现在贵不贵」的一半，另一半是「历史上这个比值
+# 通常是多少」。为此要把波动率也铺成逐日序列：每个交易日都用「截至当日」的
+# window 个对数日收益重算，口径与 realized_vol 完全一致（同一个公式、同一组价）。
+# 注意别用「今天的波动率 ÷ 历史年化」——那会把两段不同时间的市场拼在一起。
+_VOL_HIST_CACHE = {}
+_CV_CACHE = {}
+
+
+def vol_history(variety, window=20, use_cache=True):
+    """逐日已实现波动率序列（%）。返回 DataFrame(date, vol)，按日期升序。
+
+    口径同 realized_vol：截至当日的 window 个对数日收益，样本标准差 × √252。
+    序列从第 window+1 个收盘价那天开始（前面不足一个窗口的自然没有值）。
+    """
+    key = (variety, window)
+    if use_cache and key in _VOL_HIST_CACHE:
+        return _VOL_HIST_CACHE[key]
+    empty = pd.DataFrame({"date": [], "vol": []})
+    spot = load_spot(variety)
+    if spot is None or not len(spot):
+        return empty
+    s = spot[["date", "spot_close"]].dropna().copy()
+    s = s.sort_values("date").reset_index(drop=True)
+    px = s["spot_close"].astype(float).values
+    dates = list(s["date"])
+    rows = []
+    if len(px) > window and bool(np.all(px > 0)):
+        rets = np.diff(np.log(px))          # rets[i] 是第 i 天 → 第 i+1 天的对数收益
+        for i in range(window, len(px)):
+            r = rets[i - window:i]          # 截至第 i 天的最近 window 个收益
+            rows.append({"date": dates[i],
+                         "vol": float(np.std(r, ddof=1) * math.sqrt(252) * 100)})
+    df = pd.DataFrame(rows) if rows else empty
+    if use_cache:
+        _VOL_HIST_CACHE[key] = df
+    return df
+
+
+def carry_vol_history(variety, tenor_days=0, window=20, use_cache=True):
+    """carry/波动 的历史序列。
+
+    tenor_days=0 → 用「滚动第 2 近月」的年化（与主口径一致）；
+    tenor_days>0 → 用固定期限插值的年化（60 / 90 天）。
+    返回 DataFrame(date, annual, vol, cv)，只保留两边都有值的日期。
+    """
+    key = (variety, tenor_days, window)
+    if use_cache and key in _CV_CACHE:
+        return _CV_CACHE[key]
+    adf = fixed_tenor_history(variety, tenor_days) if tenor_days else variety_history(variety)
+    vdf = vol_history(variety, window)
+    if adf is None or vdf is None or not len(adf) or not len(vdf):
+        return None
+    a = adf[["date", "annual"]].dropna()
+    m = a.merge(vdf, on="date", how="inner")
+    m = m[m["vol"] > 0].copy()
+    if not len(m):
+        return None
+    m["cv"] = m["annual"] / m["vol"]
+    m = m.sort_values("date").reset_index(drop=True)
+    if use_cache:
+        _CV_CACHE[key] = m
+    return m
 
 
 # ============ 3. 移仓价差（两两合约对） ============
@@ -496,12 +784,34 @@ def move_helper_table(variety, years=1, as_of=None, live_prices=None, live_date=
 
 
 # ============ 缓存清理（供"页面上一键更新数据"使用） ============
+# ⚠️ 新增任何进程内缓存，都必须登记到下面这张表里。
+#    漏登记的后果：点「更新数据」后该页面继续显示旧数据，只有重启服务才会好
+#    （2026-11-21 就漏过 _FT_CACHE / _CURVE_CACHE / _VOL_CACHE / _CV_CACHE）。
+_CACHE_REGISTRY = (
+    ("_VARIETY_HISTORY_CACHE", "_VARIETY_HISTORY_CACHE"),
+    ("_PAIR_SERIES_CACHE", "_PAIR_SERIES_CACHE"),
+    ("_SPREAD_POOL_CACHE", "_SPREAD_POOL_CACHE"),
+    ("_CURVE_CACHE", "_CURVE_CACHE"),
+    ("_FT_CACHE", "_FT_CACHE"),
+    ("_VOL_CACHE", "_VOL_CACHE"),
+    ("_VOL_HIST_CACHE", "_VOL_HIST_CACHE"),
+    ("_CV_CACHE", "_CV_CACHE"),
+)
+
+
 def clear_caches():
-    """清空本模块的三个进程内缓存。
+    """清空本模块全部进程内缓存。
 
     与 data_source.clear_caches() 配套：抓取新数据后两个模块都要清，
-    否则"历史贴水"和"移仓助手"两页仍会显示旧数据。
+    否则"历史贴水"/"移仓助手"/"基差看板"仍会显示旧数据。
+
+    2026-11-21 起改为按 _CACHE_REGISTRY 遍历，新增缓存只需在上面加一行。
     """
-    _VARIETY_HISTORY_CACHE.clear()
-    _PAIR_SERIES_CACHE.clear()
-    _SPREAD_POOL_CACHE.clear()
+    cleared = []
+    for name, _ in _CACHE_REGISTRY:
+        d = globals().get(name)
+        if isinstance(d, dict):
+            d.clear()
+            cleared.append(name)
+    return cleared
+

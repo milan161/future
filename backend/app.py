@@ -130,16 +130,55 @@ def build_realtime_payload(variety, quotes=None, spot_q=None):
             "annual": round(annual, 2) if annual is not None else None,
             "days_left": days_left,
         })
+    # 已实现波动率：给「折合年化」配一个风险分母。
+    # 年化贴水单独看没有意义 —— 23% 的贴水在 20% 波动的市场里是厚利，
+    # 在 40% 波动的市场里只是风险补偿。carry/波动 = 年化 ÷ 波动。
+    vol = engine.realized_vol(variety)
+    if vol is not None:
+        for r in rows:
+            r["carry_vol"] = engine.carry_per_vol(r.get("annual"), vol)
     return {
         "ok": True, "variety": variety,
         "name": cfg.get("name", ""),
         "spot": spot_q,
         "rows": rows,
         "spot_percentile": engine.spot_percentile(variety, years=3, current_value=spot_price),
+        "vol": round(vol, 2) if vol is not None else None,
+        "vol_window": 20,
         "is_trading": rt.is_trading_time(),
         "is_live": bool(spot_price is not None and len(rows) > 0),
         "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def _live_fixed_tenor(variety, tenor_days):
+    """
+    用后台聚合的实时快照，把「今天的合约曲线」插值到固定期限。
+
+    不额外发外网请求：/api/realtime_all 的后台线程每 10 秒已经把四个品种
+    全部在交易合约的 basis_pct / days_left 放进 _RT_CACHE，这里只读内存。
+    拿不到快照（冷启动首轮还没跑完）就返回 None，前端退回用日线末点。
+    """
+    with _RT_LOCK:
+        payload = _RT_CACHE.get("payload")
+    if not payload:
+        return None
+    vd = (payload.get("varieties") or {}).get(variety)
+    if not vd:
+        return None
+    pts = []
+    for r in vd.get("rows") or []:
+        dl, bp = r.get("days_left"), r.get("basis_pct")
+        if dl is None or bp is None or dl <= 0:
+            continue
+        pts.append({"symbol": r["symbol"], "days_left": dl, "basis_pct": bp})
+    if len(pts) < 2:
+        return None
+    pts.sort(key=lambda p: p["days_left"])
+    ip = engine.interpolate_curve(pts, tenor_days)
+    if ip is None:
+        return None
+    return ip["basis_pct"] * 365 / int(tenor_days)
 
 
 # ============ 数据更新（页面一键抓取，仅本机开放） ============
@@ -380,10 +419,16 @@ class Handler(SimpleHTTPRequestHandler):
             spot_last = None
             if spot is not None and len(spot):
                 spot_last = {"date": spot["date"].iloc[-1], "close": float(spot["spot_close"].iloc[-1])}
+            # carry/波动：到期收益（基差率）÷ 近 20 日已实现波动率
+            vol = engine.realized_vol(variety)
+            for r in rows:
+                r["carry_vol"] = engine.carry_per_vol(r.get("annual"), vol)
             return json_resp(self, {
                 "ok": True, "variety": variety,
                 "name": VARIETIES.get(variety, {}).get("name", ""),
                 "spot": spot_last, "rows": rows,
+                "vol": round(vol, 2) if vol is not None else None,
+                "vol_window": 20,
             })
 
         # ---- 铁矿石图表（现货 / 最近合约 / 主力合约 / 基差率 / 年度对比）----
@@ -488,6 +533,76 @@ class Handler(SimpleHTTPRequestHandler):
                 st = engine.metric_stats(hist_rows, mk, current=live_cur.get(mk))
                 if st:
                     metrics[mk] = st
+
+            # ---- 固定期限口径（60 / 90 天）：与「滚动第 2 近月」并存的第二套 ----
+            # 为什么需要：滚动第 2 近月的剩余天数在 1~70 天之间来回跳，年化 =
+            # 基差率×365/天 的分母自带机械噪声，近月到期那几天天然占住历史高位，
+            # 分位数被「离到期多远」污染。固定期限把分母钉死，同样一段历史才可比。
+            # 详见 engine.fixed_tenor_history 的注释。
+            tenors = {}
+            # 当前波动率（近 20 日）—— 先算出来，下面滚动/固定期限两条 carry/波动 都要用
+            vol = engine.realized_vol(variety)
+
+            def _cv_pack(tenor_days, live_annual_v):
+                """打包某个口径的 carry/波动 历史序列 + 统计。
+
+                年化和波动率都按「当日」取，按日期内连接后再相除；
+                用今日波动率去除历史年化是错的（等于拼两个不同时间的市场）。
+                """
+                cdf = engine.carry_vol_history(variety, tenor_days)
+                if cdf is None or not len(cdf):
+                    return None, None
+                if years > 0:
+                    csub = cdf[pd.to_datetime(cdf["date"]) >= cutoff]
+                    if len(csub) < 20:
+                        csub = cdf
+                else:
+                    csub = cdf
+                rows = [{"date": r["date"], "annual": round(float(r["cv"]), 2)}
+                        for _, r in csub.iterrows()]
+                live_cv = engine.carry_per_vol(live_annual_v, vol)
+                st = engine.metric_stats(rows, "annual", current=live_cv)
+                if live_cv is not None:
+                    rows = rows + [{"date": "今", "annual": round(live_cv, 2), "live": True}]
+                return rows, st
+
+            for T in engine.FT_TENORS:
+                fdf = engine.fixed_tenor_history(variety, T)
+                if fdf is None or not len(fdf):
+                    continue
+                if years > 0:
+                    fsub = fdf[pd.to_datetime(fdf["date"]) >= cutoff]
+                    if len(fsub) < 20:
+                        fsub = fdf
+                else:
+                    fsub = fdf
+                frows = [{"date": r["date"], "annual": r["annual"],
+                          "basis_pct": r["basis_pct"],
+                          "symbol": r["near_symbol"], "far_symbol": r["far_symbol"]}
+                         for _, r in fsub.iterrows()]
+                live_ft = _live_fixed_tenor(variety, T)
+                st = engine.metric_stats(frows, "annual", current=live_ft)
+                if not st:
+                    continue
+                if live_ft is not None:
+                    frows = frows + [{"date": "今", "annual": round(live_ft, 2),
+                                      "basis_pct": None, "symbol": None, "live": True}]
+                tenors[str(T)] = {
+                    "tenor": T, "series": frows, "metrics": st,
+                    "live": live_ft is not None,
+                    "live_current": round(live_ft, 2) if live_ft is not None else None,
+                }
+                # 该口径对应的 carry/波动 历史（分母钉死后的「性价比」序列）
+                fcv_rows, fcv_st = _cv_pack(T, live_ft)
+                tenors[str(T)]["cv_series"] = fcv_rows
+                tenors[str(T)]["cv_metrics"] = fcv_st
+
+            # carry/波动：给「年化贴水」配一个风险分母（详见 engine.realized_vol）
+            a_cur = (metrics.get("annual") or {}).get("current")
+            carry_vol = engine.carry_per_vol(a_cur, vol)
+            # 滚动口径的 carry/波动 历史序列（前端第四种「指标」就是画它）
+            cv_rows, cv_stats = _cv_pack(0, live_annual)
+
             # 兼容旧字段结构（前端已改为读 metrics，这里保留 cur_symbol 等）
             a_stats = metrics.get("annual") or {}
             return json_resp(self, {
@@ -498,6 +613,12 @@ class Handler(SimpleHTTPRequestHandler):
                 "is_trading": rt.is_trading_time(),
                 "server_time": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "metrics": metrics,
+                "tenors": tenors,
+                "vol": round(vol, 2) if vol is not None else None,
+                "vol_window": 20,
+                "carry_vol": carry_vol,
+                "cv_series": cv_rows,
+                "cv_metrics": cv_stats,
                 "stats": {
                     "cur_annual": a_stats.get("current"),
                     "cur_basis": (metrics.get("basis") or {}).get("current", cur_basis),
@@ -623,8 +744,38 @@ def start_realtime_worker():
           % (_RT_REFRESH_SEC, _RT_IDLE_SEC), flush=True)
 
 
+def _warm_history_caches():
+    """后台预热历史序列缓存（启动后立刻开始，顺序执行）。
+
+    为什么需要：/api/history 第一次命中要现算 variety_history / 期限曲线 /
+    固定期限两套 / 波动率与 carry-vol。ARM 上单个品种冷启动约 1.7s，
+    四个品种并发打进来就是 4 份重活抢 GIL，首屏很容易撞上 20s 超时，
+    表现是"有页面、图表空着"。改成启动就按品种顺序预热：
+    用户点开时基本都是缓存命中（约 1.1s）。
+    """
+    time.sleep(1.0)  # 先让 HTTP 端口和实时快照起来，别和高频行情抢
+    for code in ENABLED_VARIETIES:
+        try:
+            engine.variety_history(code)
+            engine.daily_contract_curves(code)
+            for T in engine.FT_TENORS:
+                engine.fixed_tenor_history(code, T)
+            engine.vol_history(code)
+            for T in (0,) + tuple(engine.FT_TENORS):
+                engine.carry_vol_history(code, T)
+            print(f"[warm] {code} 历史缓存就绪", flush=True)
+        except Exception as e:  # 预热失败不能影响服务
+            print(f"[warm] {code} 预热失败: {e}", flush=True)
+
+
+def start_warm_worker():
+    t = threading.Thread(target=_warm_history_caches, name="future-warm", daemon=True)
+    t.start()
+
+
 def main():
     start_realtime_worker()
+    start_warm_worker()
     port = int(os.environ.get("FUTURE_PORT", DEFAULT_PORT))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"future 服务已启动: http://127.0.0.1:{port}")

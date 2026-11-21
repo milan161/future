@@ -38,6 +38,14 @@
   .down { color: #16a34a; }
   .mut { color: #94a3b8; }
 
+  /* 窄屏（手机）：基差表 7 列 + 每个数值下面的小字，按默认 padding 会横向溢出。
+     收窄左右留白、让表头换行 —— 宁可表头两行，也不让「折合年化」被挤出屏幕。 */
+  @media (max-width: 480px) {
+    th { white-space: normal; line-height: 1.25; padding: 8px 4px; font-size: 11.5px; }
+    td { padding: 9px 4px; font-size: 13px; }
+    td .subv { font-size: 10.5px; }
+  }
+
   /* 分位参照专用色 —— 与曲线图例一一对应，三色差异最大化。
      不用 .up/.down：那套是"涨红跌绿"的行情感，借用会让人误以为是涨跌。
      绿 → 30%分位 / 青蓝 → 50%分位 / 红 → 75%分位。
@@ -85,6 +93,20 @@
   .mseg .m { flex: 1 1 0; min-width: 0; padding: 8px 2px; text-align: center; border-radius: 7px; font-size: 13px; background: #f1f5f9;
              color: #64748b; cursor: pointer; white-space: nowrap; }
   .mseg .m.on { background: #dbeafe; color: #1d4ed8; font-weight: 600; }
+  /* 期限口径切换（次月滚动 / 固定 60 / 90 天）：比指标切换更轻，只作用于年化 */
+  .tseg { padding-top: 6px; }
+  .tseg .m { font-size: 12px; padding: 6px 2px; background: #f8fafc; }
+  .tseg .m.on { background: #e0f2fe; color: #0369a1; }
+
+  /* 三种口径对比表（同一时刻、不同年化分母） */
+  .cmpt tr.on td { background: #eff6ff; }
+  .cmpt td:first-child, .cmpt th:first-child { font-family: inherit; color: #334155; font-weight: 600; }
+  .cmpt td { font-size: 13px; }
+  .cmpt th { font-size: 12px; }
+  .cmpt td .subv { font-size: 10.5px; }
+  /* 基差表里的辅助数值：主值下方的小字（到期收益 / carry-波动），
+     不单独占列 —— 手机上 9 列会横向溢出。 */
+  td .subv { display: block; font-size: 11px; opacity: .82; margin-top: 1px; font-weight: 400; }
 
   /* 统计块 */
   .statgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #f1f5f9; }
@@ -236,7 +258,7 @@
       <div class="bd">
         <table>
           <thead><tr>
-            <th>合约</th><th>价格</th><th title="期货涨跌幅按交易所惯例对「昨结算」计算；上方现货指数对「前收盘」计算，两者基准不同">日内(昨结)</th><th title="涨跌额 = 现价 − 昨结算">涨跌额</th><th>剩余天</th><th>基差</th><th>折合年化</th>
+            <th>合约</th><th>价格</th><th title="期货涨跌幅按交易所惯例对「昨结算」计算；上方现货指数对「前收盘」计算，两者基准不同">日内(昨结)</th><th title="涨跌额 = 现价 − 昨结算">涨跌额</th><th>剩余天</th><th title="上方：基差 = 现货 − 期货；下方小字：到期收益 = 基差 ÷ 现货价（持有到交割、忽略指数涨跌能吃到的绝对收益）">基差</th><th title="上方：折合年化 = 到期收益 × 365/剩余天数；下方小字：carry/波动 = 折合年化 ÷ 近20日已实现波动率">折合年化</th>
           </tr></thead>
           <tbody>
             <tr v-for="r in g.rows" :key="r.symbol">
@@ -245,8 +267,14 @@
               <td :class="(r.change_pct||0)>=0?'up':'down'">{{ r.change_pct!=null?fmt(r.change_pct,2)+'%':'-' }}</td>
               <td :class="(r.change||0)>=0?'up':'down'">{{ r.change!=null?fmt(r.change,1):'-' }}</td>
               <td class="mut">{{ r.days_left }}</td>
-              <td :class="r.basis>=0?'up':'down'">{{ fmt(r.basis,2) }}</td>
-              <td :class="r.annual>=0?'up':'down'">{{ r.annual!=null?fmt(r.annual,2)+'%':'-' }}</td>
+              <td :class="r.basis>=0?'up':'down'">
+                {{ fmt(r.basis,2) }}
+                <span class="subv">{{ r.basis_pct!=null?fmt(r.basis_pct,2)+'%':'-' }}</span>
+              </td>
+              <td :class="r.annual>=0?'up':'down'">
+                {{ r.annual!=null?fmt(r.annual,2)+'%':'-' }}
+                <span class="subv">{{ r.carry_vol!=null?fmt(r.carry_vol,2):'-' }}</span>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -264,7 +292,9 @@
 
     <div class="disclaimer">
       基差 = 现货价 − 期货价，正数表示贴水。<br>
-      折合年化 = (基差 / 现货价) × (365 / 剩余天数) × 100%<br>
+      <b>到期收益</b> = 基差 / 现货价：假设持有到交割、期间指数原地不动，能吃到的绝对收益。<br>
+      折合年化 = 到期收益 × (365 / 剩余天数)。<br>
+      <b>carry/波动</b> = 折合年化 ÷ 近20日已实现波动率（对数日收益标准差 × √252）：每承担 1% 波动换回多少年化收益。<br>
       点位分位 = 当前指数点位在近3年历史中的位置。<br>
       数据源：新浪财经实时行情。
     </div>
@@ -286,6 +316,16 @@
       <div class="m" :class="{on: hist.metric==='annual'}" @click="setMetric('annual')">年化收益率</div>
       <div class="m" :class="{on: hist.metric==='basis'}" @click="setMetric('basis')">基差</div>
       <div class="m" :class="{on: hist.metric==='spot'}" @click="setMetric('spot')">指数收盘价</div>
+      <div class="m" :class="{on: hist.metric==='cv'}" title="贴水/波动 = 当日折合年化 ÷ 当日近20日已实现波动率" @click="setMetric('cv')">贴水/波动</div>
+    </div>
+
+    <!-- 期限口径：年化收益率的「分母」怎么定。默认仍用真实的滚动第2近月，
+         固定60/90天是把剩余天数钉死后的纯贴水厚度，两者并存对比。
+         贴水/波动 同样分三种口径（分子取哪一个年化）。 -->
+    <div class="mseg tseg" v-if="hist.metric==='annual' || hist.metric==='cv'">
+      <div class="m" :class="{on: hist.tenor===0}" @click="setTenor(0)">次月滚动</div>
+      <div class="m" :class="{on: hist.tenor===60}" @click="setTenor(60)">固定60天</div>
+      <div class="m" :class="{on: hist.tenor===90}" @click="setTenor(90)">固定90天</div>
     </div>
 
     <div class="updglobal" v-if="histLive">
@@ -300,7 +340,7 @@
       <div class="statgrid">
         <div class="it">
           <div class="lb">{{ metricLabel }}</div>
-          <div class="vl" :class="cur.current>=0?'up':'down'">
+          <div class="vl" :class="hist.metric==='cv' ? '' : (cur.current>=0?'up':'down')">
             {{ cur.current!=null?fmt(cur.current,2)+metricUnit:'-' }}
           </div>
         </div>
@@ -315,7 +355,51 @@
         <div class="it"><div class="lb q-high">75%分位</div><div class="vl q-high">{{ cur.q75!=null?fmt(cur.q75,2)+metricUnit:'-' }}</div></div>
       </div>
       <div class="note">
-        基准合约：{{ hist.stats?hist.stats.cur_symbol:'-' }}（每个交易日滚动取当前第2近月）<span v-if="histLive"> · 当前值含实时价</span>
+        <span v-if="hist.metric==='cv'">
+          贴水/波动 = 当日折合年化 ÷ 当日近 {{ hist.vol_window }} 日已实现波动率
+          （{{ hist.tenor>0?('固定 '+hist.tenor+' 天'):'次月滚动' }}口径）。
+          等于 1 就是「承担 1% 波动，正好换回 1% 年化贴水」。
+        </span>
+        <span v-else-if="hist.metric==='annual' && hist.tenor>0">
+          口径：在当日全部在交易合约的期限结构上，按剩余天数线性插值到 {{ hist.tenor }} 天再年化
+          （插值的是基差率，不是年化值）。
+        </span>
+        <span v-else>基准合约：{{ hist.stats?hist.stats.cur_symbol:'-' }}（每个交易日滚动取当前第2近月）</span>
+        <span v-if="histLive"> · 当前值含实时价</span>
+      </div>
+    </div>
+
+    <!-- 三种口径并排：同一时刻、同一张合约曲线，只是年化的分母不同。
+         次月滚动 ≈ 真实的次月合约；固定60/90天 = 把期限钉死后的纯贴水。
+         最后一列是「贴水/波动」：同样的贴水，在多大波动下拿到 —— 性价比。 -->
+    <div class="card" v-if="tenorRows.length">
+      <div class="hd">同一时刻 · 三种口径 <span class="tag">当前值与分位</span></div>
+      <table class="cmpt">
+        <thead><tr>
+          <th>口径</th><th>当前</th><th>历史分位</th><th>中位数</th>
+          <th title="贴水/波动 = 折合年化 ÷ 近20日已实现波动率；小字为该比值自身的历史分位">贴水/波动</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="r in tenorRows" :key="r.key" :class="{on: r.active}">
+            <td>{{ r.label }}</td>
+            <td :class="(r.current||0)>=0?'up':'down'">{{ r.current!=null?fmt(r.current,2)+'%':'-' }}</td>
+            <td>{{ r.percentile!=null?fmt(r.percentile,1)+'%':'-' }}</td>
+            <td class="mut">{{ r.q50!=null?fmt(r.q50,2)+'%':'-' }}</td>
+            <td :class="(r.cv||0)>=1?'up':''">
+              {{ r.cv!=null?fmt(r.cv,2):'-' }}
+              <span class="subv">{{ r.cvPct!=null?fmt(r.cvPct,1)+'% 分位':'' }}</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="note">
+        次月滚动用的是今日第2近月合约本身的年化（剩余天数随时在变）；
+        固定60/90天把分母钉死，因此更可比、也更能反映贴水本身厚薄。<br>
+        <span v-if="hist.vol">
+          近{{ hist.vol_window }}日已实现波动率 {{ fmt(hist.vol,1) }}%。<br>
+        </span>
+        <b>贴水/波动</b>（carry/波动）把年化除以同期波动：&lt;1 说明贴水补偿不了波动，
+        &gt;1 才算「厚到扛得住」。小字是该比值自己在同样窗口里的历史分位。
       </div>
     </div>
 
@@ -323,13 +407,20 @@
       <div class="hd">{{ metricName }}走势 <span class="tag">{{ cur?cur.start+' ~ '+cur.end:'' }}</span></div>
       <div class="chartbox"><canvas ref="histCanvas"></canvas></div>
       <div class="legend">
-        <span class="lg"><i class="sw" :style="{background: hist.metric==='spot'?'#0f766e':'#2563eb'}"></i>{{ metricName }}</span>
+        <span class="lg"><i class="sw" :style="{background: metricColor}"></i>{{ metricName }}</span>
         <span class="lg"><i class="sw" style="background:#16a34a"></i>25%分位</span>
         <span class="lg"><i class="sw" style="background:#0891b2"></i>中位数</span>
         <span class="lg"><i class="sw" style="background:#ef4444"></i>75%分位</span>
       </div>
       <div class="note" v-if="cur">
-        样本 {{ cur.sample }} 个交易日（不含实时点），基准合约为「次月合约」（每个交易日滚动取当前第2近月）。<br>
+        样本 {{ cur.sample }} 个交易日（不含实时点）。
+        <span v-if="hist.metric==='cv'">
+          口径：当日折合年化 ÷ 当日近 {{ hist.vol_window }} 日已实现波动率（{{ hist.tenor>0?('固定 '+hist.tenor+' 天'):'次月滚动' }}）。
+        </span>
+        <span v-else-if="hist.metric==='annual' && hist.tenor>0">
+          口径：固定 {{ hist.tenor }} 天（在当日合约曲线上插值，分母钉死）。
+        </span>
+        <span v-else>基准合约为「次月合约」（每个交易日滚动取当前第2近月）。</span><br>
         百分位 = 历史上低于当前值的占比。
       </div>
     </div>
@@ -853,6 +944,8 @@ createApp({
 
     // 支持 ?tab=hist&metric=basis 直达，便于分享/调试
     const _initMetric = new URLSearchParams(location.search).get('metric');
+    // ?tenor=60 / 90 可直接进固定期限口径（便于分享/排查）
+    const _initTenor = parseInt(new URLSearchParams(location.search).get('tenor'), 10);
 
     // 基差看板（四品种罗列）
     const groups = ref([]);
@@ -862,9 +955,14 @@ createApp({
     const fetchErr = ref('');
     let lastFetch = Date.now();
     // 历史
+    // tenor: 0 = 次月滚动（默认，真实可交易基准）；60/90 = 固定期限插值口径。
+    // tenors 由 /api/history 一次返回两套，切口径只换显示、不重新请求。
     const hist = reactive({ variety:'IC', years:1,
-      metric: (['annual','basis','spot'].includes(_initMetric) ? _initMetric : 'annual'),
-      series:[], stats:null, metrics:null });
+      metric: (['annual','basis','spot','cv'].includes(_initMetric) ? _initMetric : 'annual'),
+      tenor: ([60,90].includes(_initTenor) ? _initTenor : 0),
+      series:[], stats:null, metrics:null, tenors:{},
+      cvSeries:[], cvMetrics:null,
+      vol:null, vol_window:20, carry_vol:null });
     const histLive = ref(false);
     const histTrading = ref(false);
     const histTime = ref('');
@@ -991,20 +1089,78 @@ createApp({
       mg.result = null;
     });
 
-    const metricName = Vue.computed(() => ({annual:'年化收益率', basis:'基差', spot:'指数收盘价'})[hist.metric]);
+    // 当前指标 × 当前期限口径下的序列。
+    // 基差/收盘价只有一套；年化和「贴水/波动」各有滚动、固定60、固定90 三套。
+    const _rollSeries = () => (hist.metric === 'cv' ? hist.cvSeries : hist.series);
+    const tenorSeries = Vue.computed(() => {
+      if (hist.metric === 'basis' || hist.metric === 'spot') return hist.series;
+      const roll = _rollSeries();
+      if (!hist.tenor) return roll;
+      const t = (hist.tenors || {})[String(hist.tenor)];
+      if (!t) return roll;
+      const arr = (hist.metric === 'cv') ? t.cv_series : t.series;
+      return (arr && arr.length) ? arr : roll;
+    });
+    const _tenorSuffix = Vue.computed(() => (hist.tenor ? (' · 固定' + hist.tenor + '天') : ''));
+    const metricName = Vue.computed(() => {
+      const base = ({annual:'年化收益率', basis:'基差', spot:'指数收盘价', cv:'贴水/波动'})[hist.metric];
+      const canTenor = (hist.metric === 'annual' || hist.metric === 'cv');
+      return (canTenor && hist.tenor) ? (base + _tenorSuffix.value) : base;
+    });
     // 当前指标对应的「指标名 + 单位」
-    const metricLabel = Vue.computed(() => ({
-      annual: '当前年化', basis: '当前基差', spot: '当前点位'
-    })[hist.metric]);
+    const metricLabel = Vue.computed(() => {
+      const base = ({annual:'当前年化', basis:'当前基差', spot:'当前点位', cv:'当前贴水/波动'})[hist.metric];
+      const canTenor = (hist.metric === 'annual' || hist.metric === 'cv');
+      return (canTenor && hist.tenor) ? ('当前' + (hist.metric === 'annual' ? '年化' : '贴水/波动') + _tenorSuffix.value) : base;
+    });
+    // 年化带 %，基差/点位是数值，贴水/波动是无量纲比值
     const metricUnit = Vue.computed(() => hist.metric === 'annual' ? '%' : '');
-    // 当前指标的统计值（切换指标时本地取用，无需重新请求）
+    const metricColor = Vue.computed(() => (
+      hist.metric === 'spot' ? '#0f766e' : (hist.metric === 'cv' ? '#7c3aed' : '#2563eb')
+    ));
+    // 当前指标的统计值（切换指标/口径时本地取用，无需重新请求）
     const cur = Vue.computed(() => {
-      const m = hist.metrics && hist.metrics[hist.metric];
-      return m || null;
+      if (hist.metric === 'basis' || hist.metric === 'spot') {
+        return (hist.metrics && hist.metrics[hist.metric]) || null;
+      }
+      const roll = (hist.metric === 'cv')
+        ? (hist.cvMetrics || null)
+        : ((hist.metrics && hist.metrics.annual) || null);
+      if (!hist.tenor) return roll;
+      const t = (hist.tenors || {})[String(hist.tenor)];
+      if (!t) return roll;
+      return (hist.metric === 'cv' ? t.cv_metrics : t.metrics) || roll;
+    });
+    // 三种口径并排对比（滚动 / 固定60 / 固定90）+ 各自的「贴水/波动」及其分位
+    const tenorRows = Vue.computed(() => {
+      const out = [];
+      const a = hist.metrics && hist.metrics.annual;
+      const acv = hist.cvMetrics;
+      if (a) out.push({
+        key: 'roll', label: '次月滚动', active: !hist.tenor,
+        current: a.current, percentile: a.percentile, q50: a.q50,
+        cv: acv ? acv.current : null, cvPct: acv ? acv.percentile : null,
+      });
+      [60, 90].forEach(T => {
+        const t = (hist.tenors || {})[String(T)];
+        if (!t || !t.metrics) return;
+        const tcv = t.cv_metrics;
+        out.push({
+          key: 'ft' + T, label: '固定' + T + '天', active: hist.tenor === T,
+          current: t.metrics.current, percentile: t.metrics.percentile, q50: t.metrics.q50,
+          cv: tcv ? tcv.current : null, cvPct: tcv ? tcv.percentile : null,
+        });
+      });
+      return out;
     });
     // 切换指标：只换显示，不重新请求
     function setMetric(mk) {
       hist.metric = mk;
+      nextTick().then(() => drawHist());
+    }
+    // 切换期限口径：同样只换显示
+    function setTenor(t) {
+      hist.tenor = (t === 0) ? 0 : t;
       nextTick().then(() => drawHist());
     }
 
@@ -1052,10 +1208,18 @@ createApp({
     }
     async function loadHist(variety, years) {
       hist.variety = variety; hist.years = years;
-      const d = await get(`/api/history?variety=${variety}&years=${years}`);
+      // 和首屏一样带一次重试：慢链路（CF 回源 / 冷缓存）下首包偶发超时很常见，
+      // 直接失败的表现就是"图表空着"。
+      const d = await getRetry(`/api/history?variety=${variety}&years=${years}`, 25000, 2);
       if (d.ok) {
         hist.series = d.series; hist.stats = d.stats;
         hist.metrics = d.metrics || null;
+        hist.tenors = d.tenors || {};
+        hist.cvSeries = d.cv_series || [];
+        hist.cvMetrics = d.cv_metrics || null;
+        hist.vol = d.vol != null ? d.vol : null;
+        hist.vol_window = d.vol_window || 20;
+        hist.carry_vol = d.carry_vol != null ? d.carry_vol : null;
         histLive.value = !!d.is_live;
         histTrading.value = !!d.is_trading;
         if (d.server_time) histTime.value = (d.server_time || '').slice(11, 16);
@@ -1412,6 +1576,14 @@ createApp({
       }
     }
 
+    // #rrggbb → rgba(...)，用于把填充色跟曲线色对齐
+    function _rgba(hex, a) {
+      const h = String(hex).replace('#', '');
+      const s = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
+      const n = parseInt(s, 16);
+      return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+    }
+
     function _paint(canvas, points, opts, W, H) {
       const dpr = window.devicePixelRatio || 1;
       canvas.width = W * dpr; canvas.height = H * dpr;
@@ -1437,7 +1609,10 @@ createApp({
         const y = padT + (ch/4)*i;
         ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL+cw, y); ctx.stroke();
         const v = mx - ((mx-mn)/4)*i;
-        let lbl = opts.pct ? v.toFixed(1)+'%' : (opts.dp===0?v.toFixed(0):v.toFixed(0));
+        // dp：小数位。年化走 pct（1 位 + %），贴水/波动是 0~2 的小数需要 2 位，
+        // 基差/点位用整数即可。原来两个分支都写 toFixed(0)，dp 形同虚设。
+        let lbl = opts.pct ? v.toFixed(1)+'%'
+          : (opts.dp != null ? v.toFixed(opts.dp) : v.toFixed(0));
         ctx.fillText(lbl, padL-5, y+3);
       }
       // 参考线颜色：与图例、卡片文字一一对应（绿/蓝/红，三色差异最大化）
@@ -1460,10 +1635,11 @@ createApp({
         if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       });
       ctx.stroke();
-      // 渐变填充
+      // 渐变填充（跟随曲线颜色，否则紫线配蓝填充很违和）
       ctx.lineTo(X(points.length-1), padT+ch); ctx.lineTo(padL, padT+ch); ctx.closePath();
       const g = ctx.createLinearGradient(0, padT, 0, padT+ch);
-      g.addColorStop(0, 'rgba(37,99,235,.16)'); g.addColorStop(1, 'rgba(37,99,235,0)');
+      g.addColorStop(0, _rgba(opts.color || '#2563eb', .16));
+      g.addColorStop(1, _rgba(opts.color || '#2563eb', 0));
       ctx.fillStyle = g; ctx.fill();
       // X轴标签
       ctx.fillStyle = '#94a3b8'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
@@ -1493,23 +1669,29 @@ createApp({
     window.__histLog = [];
     function drawHist() {
       const el = histCanvas.value;
-      const _dbg = { t: new Date().toLocaleTimeString(), ref: !!el, n: hist.series.length };
+      // 当前口径下的序列（年化可能来自固定期限插值，其余指标只有滚动口径）
+      const src = tenorSeries.value || [];
+      const _dbg = { t: new Date().toLocaleTimeString(), ref: !!el, n: src.length, tenor: hist.tenor };
       if (el) { _dbg.cw = el.clientWidth; _dbg.ch = el.clientHeight; _dbg.connected = el.isConnected; }
       window.__histLog.push(_dbg);
       if (window.__histLog.length > 8) window.__histLog.shift();
       // canvas 的 ref 可能尚未绑定（切 Tab / 首次渲染的时序问题）。
       // 不要静默 return —— 登记一个"待重绘"意图，由兜底机制完成。
-      if (!el || !hist.series.length) { scheduleHistRedraw(); return; }
-      const pts = hist.series.map(s => ({
+      if (!el || !src.length) { scheduleHistRedraw(); return; }
+      const pts = src.map(s => ({
         x: (s.date||'').slice(2),
-        y: hist.metric==='annual' ? s.annual : (hist.metric==='basis' ? s.basis : s.spot),
+        // 贴水/波动 的序列把比值放在 annual 字段里（后端已算好），不是百分数
+        y: hist.metric==='annual' ? s.annual
+          : (hist.metric==='cv' ? s.annual
+          : (hist.metric==='basis' ? s.basis : s.spot)),
       }));
       let lines = null;
-      // 分位参考线：三个指标都画（都用各自的 25/50/75 分位）
+      // 分位参考线：四个指标都画（都用各自的 25/50/75 分位）
       const c = cur.value;
       if (c) lines = [c.q25, c.q50, c.q75];
       drawLine(el, pts, { pct: hist.metric==='annual', lines,
-                          color: hist.metric==='spot'?'#0f766e':'#2563eb',
+                          color: metricColor.value,
+                          dp: hist.metric==='cv' ? 2 : 0,
                           highlightLast: histLive.value });
     }
 
@@ -1641,7 +1823,8 @@ createApp({
       hist, expanded, mg,
       iron, ironRanges, loadIron, ironLast, ironSpan, annualSpan, ironBuilt, thisYear,
       ironPriceCanvas, ironBasisCanvas, ironAnnualCanvas,
-      metricName, metricLabel, metricUnit, cur, setMetric,
+      metricName, metricLabel, metricUnit, metricColor, cur, setMetric,
+      tenorRows, setTenor, tenorSeries,
       loadHist, loadMove, togglePair, calcMargin, resetMargin, switchTab,
       retryBasis,
       fmt, histCanvas, setPairCanvas,
